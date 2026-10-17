@@ -1,0 +1,39 @@
+{
+  "name": "debug-web-mcp",
+  "version": "0.1.0",
+  "description": "Standalone localhost web debugging MCP server using Chrome DevTools Protocol",
+  "license": "MIT",
+  "bin": {
+    "debug-web": "dist/main.js"
+  },
+  "type": "module",
+  "scripts": {
+    "prepack": "npm run build",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "dev": "tsx src/main.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "oxlint src tests",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check ."
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "ws": "8.21.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@types/node": "26.6.4",
+    "@types/ws": "8.18.1",
+    "oxfmt": "0.72.0",
+    "oxlint": "1.87.0",
+    "tsx": "4.20.6",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

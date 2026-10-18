@@ -3,36 +3,40 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 
 import { CdpConnection } from "./cdp/connection.js";
+import { discoverCdpEndpoint, pageSocketForTarget, validateCdpEndpoint } from "./cdp/discovery.js";
+import { captureDomSnapshot } from "./cdp/dom.js";
 import {
-  discoverCdpEndpoint,
-  isLocalHttpUrl,
-  pageSocketForTarget,
-  validateCdpEndpoint,
-} from "./cdp/discovery.js";
+  buildAllowedOrigins,
+  isHttpUrl,
+  MAX_ALLOWED_ORIGINS,
+  parseExactOrigin,
+} from "./origins.js";
 import { DebugWebSessionStore } from "./sessionStore.js";
 import type { DebugWebSession } from "./sessionStore.js";
 
 const MAX_BODY_BYTES = 1_048_576;
+const MAX_DOM_BYTES = 2_000_000;
 const endpointInput = z.strictObject({ cdp_endpoint: z.string().url() });
 const sessionInput = z.strictObject({ session_id: z.string().min(1) });
-const localOriginSchema = z
-  .string()
-  .url()
-  .transform((value, context) => {
-    const url = localOrigin(value);
-    if (url === undefined || url.origin !== value.replace(/\/$/u, "")) {
-      context.addIssue({
-        code: "custom",
-        message: "Expected an exact localhost HTTP(S) origin",
-      });
-      return z.NEVER;
-    }
-    return url.origin;
-  });
+const exactOriginSchema = z.string().transform((value, context) => {
+  try {
+    return parseExactOrigin(value);
+  } catch (cause) {
+    context.addIssue({
+      code: "custom",
+      message: cause instanceof Error ? cause.message : "Invalid origin.",
+    });
+    return z.NEVER;
+  }
+});
+const listTargetsInput = z.strictObject({
+  ...endpointInput.shape,
+  origin: exactOriginSchema.optional(),
+});
 const openSessionInput = z.strictObject({
   ...endpointInput.shape,
   target_id: z.string().min(1),
-  allowed_origins: z.array(localOriginSchema).max(8).default([]),
+  allowed_origins: z.array(exactOriginSchema).max(MAX_ALLOWED_ORIGINS).default([]),
 });
 export const debugWebStartCaptureInputSchema = z.strictObject({
   session_id: z.string().min(1),
@@ -40,6 +44,12 @@ export const debugWebStartCaptureInputSchema = z.strictObject({
   capture_request_bodies: z.boolean().default(false),
   capture_response_bodies: z.boolean().default(false),
   max_body_bytes: z.number().int().min(1).max(MAX_BODY_BYTES).default(262_144),
+});
+export const debugWebGetDomInputSchema = z.strictObject({
+  session_id: z.string().min(1),
+  max_nodes: z.number().int().min(1).max(50_000).default(5_000),
+  include_attribute_values: z.boolean().default(false),
+  include_text: z.boolean().default(false),
 });
 const listRequestsInput = z.strictObject({
   session_id: z.string().min(1),
@@ -68,8 +78,6 @@ const failure = (message: string) => ({
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
-const localOrigin = (value: string): URL | undefined => isLocalHttpUrl(value);
-
 const liveSession = (store: DebugWebSessionStore, id: string): DebugWebSession | undefined => {
   const session = store.get(id);
   return session !== undefined && !session.closed ? session : undefined;
@@ -79,11 +87,12 @@ const registerTargetListTool = (server: McpServer): void => {
   server.registerTool(
     "browser_list_targets",
     {
-      description: "List localhost development tabs exposed by a loopback Chrome CDP endpoint.",
-      inputSchema: endpointInput.shape,
+      description:
+        "List HTTP(S) page tabs exposed by a loopback Chrome CDP endpoint, optionally filtered to one exact origin. Remote pages are listed only for inspection you are authorized to perform.",
+      inputSchema: listTargetsInput.shape,
     },
     async (raw) => {
-      const input = endpointInput.parse(raw);
+      const input = listTargetsInput.parse(raw);
       let endpoint: URL;
       try {
         endpoint = validateCdpEndpoint(input.cdp_endpoint);
@@ -98,8 +107,11 @@ const registerTargetListTool = (server: McpServer): void => {
             protocol_version: discovered.protocolVersion,
           },
           targets: discovered.targets.flatMap((target) => {
-            const url = localOrigin(target.url);
-            return target.type === "page" && url !== undefined && target.webSocket !== undefined
+            const url = isHttpUrl(target.url);
+            return target.type === "page" &&
+              url !== undefined &&
+              target.webSocket !== undefined &&
+              (input.origin === undefined || url.origin === input.origin)
               ? [
                   {
                     target_id: target.id,
@@ -123,7 +135,7 @@ const registerOpenSessionTool = (server: McpServer, store: DebugWebSessionStore)
     "browser_open_session",
     {
       description:
-        "Attach to one selected localhost development tab. Optionally authorize exact additional localhost origins, such as a separate API port. Chrome and tabs remain user-owned.",
+        "Attach to one selected HTTP(S) page and scope capture to its current origin. Add exact extra origins (for example an API or CDN host) when the page talks to them. Inspect only pages you are authorized to debug; Chrome and tabs remain user-owned.",
       inputSchema: openSessionInput.shape,
     },
     async (raw) => {
@@ -140,11 +152,11 @@ const registerOpenSessionTool = (server: McpServer, store: DebugWebSessionStore)
           (item) => item.id === input.target_id && item.type === "page",
         );
         if (target === undefined) return failure("Selected page target was not found.");
-        const url = localOrigin(target.url);
-        if (url === undefined) return failure("Only localhost development pages may be inspected.");
+        const url = isHttpUrl(target.url);
+        if (url === undefined) return failure("Only HTTP(S) pages may be inspected.");
         const socket = pageSocketForTarget(endpoint, target);
         const connection = await CdpConnection.connect(socket);
-        const allowedOrigins = new Set([url.origin, ...input.allowed_origins]);
+        const allowedOrigins = buildAllowedOrigins(url.origin, input.allowed_origins);
         const session = store.create(target.id, url.origin, allowedOrigins, connection);
         return result({
           session_id: session.session_id,
@@ -319,17 +331,45 @@ const registerCloseTool = (server: McpServer, store: DebugWebSessionStore): void
   );
 };
 
+const registerGetDomTool = (server: McpServer, store: DebugWebSessionStore): void => {
+  server.registerTool(
+    "browser_get_dom",
+    {
+      description:
+        "Capture the selected page's DOM structure read-only through CDP without evaluating JavaScript. Node names, types, parents, and attribute names are returned by default; attribute values and text nodes are opt-in and size-bounded.",
+      inputSchema: debugWebGetDomInputSchema.shape,
+    },
+    async (raw) => {
+      const input = debugWebGetDomInputSchema.parse(raw);
+      const session = liveSession(store, input.session_id);
+      if (session === undefined) return failure("Session is missing or its tab closed.");
+      try {
+        const dom = await captureDomSnapshot(session.connection, {
+          maxNodes: input.max_nodes,
+          includeAttributeValues: input.include_attribute_values,
+          includeText: input.include_text,
+          maxBytes: MAX_DOM_BYTES,
+        });
+        return result({ session_id: session.session_id, ...dom });
+      } catch (cause) {
+        return failure(errorMessage(cause));
+      }
+    },
+  );
+};
+
 export const createDebugWebServer = (store = new DebugWebSessionStore()): McpServer => {
   const server = new McpServer(
     { name: "debug-web", version: "1.0.0" },
     {
       instructions:
-        "Debug Web inspects localhost development websites. Network, console, navigation, and WebSocket captures stay in process memory and are deleted on session/process closure. Credentials are redacted. Screenshots are not provided.",
+        "Debug Web inspects HTTP(S) web pages you own or are authorized to debug. The selected page's origin is captured by default; add exact extra origins when the page talks to other hosts. Network, console, navigation, and WebSocket captures stay in process memory and are deleted on session/process closure. Credentials are redacted. Screenshots are not provided.",
     },
   );
   registerTargetListTool(server);
   registerOpenSessionTool(server, store);
   registerCaptureTools(server, store);
+  registerGetDomTool(server, store);
   registerQueryTools(server, store);
   registerCloseTool(server, store);
   return server;
@@ -358,7 +398,7 @@ export const runDebugWeb = async (): Promise<void> => {
 };
 
 const disableDomains = async (session: DebugWebSession): Promise<void> => {
-  for (const domain of ["Network", "Runtime", "Page"] as const) {
+  for (const domain of ["Network", "Runtime", "Page", "DOM"] as const) {
     try {
       await session.connection.send(`${domain}.disable`);
     } catch {

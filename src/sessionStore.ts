@@ -349,7 +349,7 @@ export class DebugWebSessionStore {
         timestamp,
         url: null,
         request_id: null,
-        detail: "navigation left the authorized local origin",
+        detail: "navigation left the authorized origin scope",
       });
     } else {
       this.#event(session, {

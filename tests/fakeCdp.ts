@@ -2,7 +2,68 @@ import { createServer, type Server } from "node:http";
 
 import WebSocket, { WebSocketServer } from "ws";
 
-const pageOrigin = "http://127.0.0.1:3100";
+interface FakeTarget {
+  readonly id: string;
+  readonly title: string;
+  readonly url: string;
+  readonly requestUrl: string;
+  readonly requestId: string;
+}
+
+const targets: readonly FakeTarget[] = [
+  {
+    id: "local-page",
+    title: "Local App",
+    url: "http://127.0.0.1:3100/home",
+    requestUrl: "http://127.0.0.1:4100/api/items",
+    requestId: "request-1",
+  },
+  {
+    id: "remote-page",
+    title: "Remote Page",
+    url: "https://example.com/",
+    requestUrl: "https://example.com/api/items",
+    requestId: "request-remote",
+  },
+];
+
+const domTree = () => ({
+  root: {
+    nodeId: 1,
+    nodeType: 9,
+    nodeName: "#document",
+    nodeValue: "",
+    children: [
+      { nodeId: 2, nodeType: 10, nodeName: "html", nodeValue: "" },
+      {
+        nodeId: 3,
+        nodeType: 1,
+        nodeName: "HTML",
+        nodeValue: "",
+        attributes: [],
+        children: [
+          {
+            nodeId: 4,
+            nodeType: 1,
+            nodeName: "BODY",
+            nodeValue: "",
+            attributes: [],
+            children: [
+              {
+                nodeId: 5,
+                nodeType: 1,
+                nodeName: "DIV",
+                nodeValue: "",
+                attributes: ["id", "app", "class", "card"],
+                children: [{ nodeId: 6, nodeType: 3, nodeName: "#text", nodeValue: "hello world" }],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+});
 
 export interface FakeCdp {
   readonly endpoint: string;
@@ -29,25 +90,18 @@ export const startFakeCdp = async (): Promise<FakeCdp> => {
       response.setHeader("content-type", "application/json");
       response.end(
         JSON.stringify([
-          {
-            id: "local-page",
+          ...targets.map((target) => ({
+            id: target.id,
             type: "page",
-            title: "Local App",
-            url: `${pageOrigin}/home`,
-            webSocketDebuggerUrl: `ws://127.0.0.1:${String(port)}/devtools/page/local-page`,
-          },
-          {
-            id: "remote-page",
-            type: "page",
-            title: "Remote Page",
-            url: "https://example.com/",
-            webSocketDebuggerUrl: `ws://127.0.0.1:${String(port)}/devtools/page/remote-page`,
-          },
+            title: target.title,
+            url: target.url,
+            webSocketDebuggerUrl: `ws://127.0.0.1:${String(port)}/devtools/page/${target.id}`,
+          })),
           {
             id: "worker",
             type: "service_worker",
             title: "Worker",
-            url: `${pageOrigin}/worker.js`,
+            url: "http://127.0.0.1:3100/worker.js",
           },
         ]),
       );
@@ -66,7 +120,8 @@ export const startFakeCdp = async (): Promise<FakeCdp> => {
   const commands: string[] = [];
   const websocket = new WebSocketServer({ server: http });
   websocket.on("connection", (socket, request) => {
-    if (request.url !== "/devtools/page/local-page") {
+    const target = targets.find((candidate) => request.url === `/devtools/page/${candidate.id}`);
+    if (target === undefined) {
       socket.close(1008, "unexpected target");
       return;
     }
@@ -94,45 +149,47 @@ export const startFakeCdp = async (): Promise<FakeCdp> => {
         );
         return;
       }
-      socket.send(JSON.stringify({ id: message.id, result: {} }));
+      socket.send(
+        JSON.stringify({
+          id: message.id,
+          result: message.method === "DOM.getDocument" ? domTree() : {},
+        }),
+      );
       if (message.method === "Network.enable") {
-        socket.send(
-          JSON.stringify({
+        for (const event of [
+          {
             method: "Network.requestWillBeSent",
             params: {
-              requestId: "request-1",
+              requestId: target.requestId,
               timestamp: 10,
               type: "Fetch",
               request: {
-                url: "http://127.0.0.1:4100/api/items",
+                url: target.requestUrl,
                 method: "POST",
                 headers: { Authorization: "Bearer hidden" },
                 postData: JSON.stringify({ item: "book", token: "caller-data" }),
               },
             },
-          }),
-        );
-        socket.send(
-          JSON.stringify({
+          },
+          {
             method: "Network.responseReceived",
             params: {
-              requestId: "request-1",
+              requestId: target.requestId,
               timestamp: 10.1,
               response: {
-                url: "http://127.0.0.1:4100/api/items",
+                url: target.requestUrl,
                 status: 201,
                 mimeType: "application/json",
                 headers: { "set-cookie": "hidden-cookie" },
               },
             },
-          }),
-        );
-        socket.send(
-          JSON.stringify({
+          },
+          {
             method: "Network.loadingFinished",
-            params: { requestId: "request-1", timestamp: 10.2, encodedDataLength: 48 },
-          }),
-        );
+            params: { requestId: target.requestId, timestamp: 10.2, encodedDataLength: 48 },
+          },
+        ])
+          socket.send(JSON.stringify(event));
       }
     });
   });

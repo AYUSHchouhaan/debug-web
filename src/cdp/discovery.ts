@@ -2,9 +2,9 @@ import { request } from "node:http";
 
 import { z } from "zod";
 
+import { isLoopbackOrigin } from "../origins.js";
 import type { CdpDiscovery, CdpTarget } from "./types.js";
 
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const MAX_DISCOVERY_BYTES = 1_048_576;
 const DISCOVERY_TIMEOUT_MS = 5_000;
 const versionSchema = z.object({
@@ -26,7 +26,7 @@ export const validateCdpEndpoint = (value: string): URL => {
   const url = new URL(value);
   if (
     url.protocol !== "http:" ||
-    !LOCAL_HOSTS.has(url.hostname) ||
+    !isLoopbackOrigin(url.origin) ||
     url.port === "" ||
     url.username !== "" ||
     url.password !== "" ||
@@ -34,22 +34,8 @@ export const validateCdpEndpoint = (value: string): URL => {
     url.search !== "" ||
     url.hash !== ""
   )
-    throw new Error("CDP endpoint must be explicit-port HTTP on localhost.");
+    throw new Error("CDP endpoint must be explicit-port HTTP on localhost or loopback.");
   return url;
-};
-
-export const isLocalHttpUrl = (value: string): URL | undefined => {
-  try {
-    const url = new URL(value);
-    return (url.protocol === "http:" || url.protocol === "https:") &&
-      LOCAL_HOSTS.has(url.hostname) &&
-      url.username === "" &&
-      url.password === ""
-      ? url
-      : undefined;
-  } catch {
-    return undefined;
-  }
 };
 
 export const discoverCdpEndpoint = async (endpoint: URL): Promise<CdpDiscovery> => {

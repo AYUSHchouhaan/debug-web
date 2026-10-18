@@ -24,6 +24,7 @@ it("runs the isolated localhost MCP workflow with bounded ephemeral captures", a
   const catalog = await client.listTools();
   expect(catalog.tools.map(({ name }) => name).sort()).toEqual([
     "browser_close_session",
+    "browser_get_dom",
     "browser_get_events",
     "browser_get_network_request",
     "browser_list_network_requests",
@@ -39,9 +40,12 @@ it("runs the isolated localhost MCP workflow with bounded ephemeral captures", a
     arguments: { cdp_endpoint: fake.endpoint },
   });
   expect(targets.structuredContent).toMatchObject({
-    targets: [{ target_id: "local-page", origin: "http://127.0.0.1:3100" }],
+    targets: [
+      { target_id: "local-page", origin: "http://127.0.0.1:3100" },
+      { target_id: "remote-page", origin: "https://example.com" },
+    ],
   });
-  expect(JSON.stringify(targets.structuredContent)).not.toContain("remote-page");
+  expect(JSON.stringify(targets.structuredContent)).not.toContain("worker");
 
   const opened = await client.callTool({
     name: "browser_open_session",
@@ -114,7 +118,7 @@ it("runs the isolated localhost MCP workflow with bounded ephemeral captures", a
   expect(fake.socketCount()).toBe(0);
 });
 
-it("rejects non-loopback CDP endpoints and unauthorized remote origins", async () => {
+it("rejects non-loopback CDP endpoints and malformed origins", async () => {
   const server = createDebugWebServer();
   const client = new Client({ name: "debug-web-invalid-test", version: "0.1.0" });
   closeables.push(client, server);
@@ -125,13 +129,66 @@ it("rejects non-loopback CDP endpoints and unauthorized remote origins", async (
     arguments: { cdp_endpoint: "http://example.com:9222" },
   });
   expect(result.isError).toBe(true);
-  const remoteOrigin = await client.callTool({
+  const malformedOrigin = await client.callTool({
     name: "browser_open_session",
     arguments: {
       cdp_endpoint: "http://127.0.0.1:9222",
       target_id: "page",
-      allowed_origins: ["https://example.com"],
+      allowed_origins: ["https://example.com/path"],
     },
   });
-  expect(remoteOrigin.isError).toBe(true);
+  expect(malformedOrigin.isError).toBe(true);
+});
+
+it("auto-scopes a remote page origin and captures its same-origin traffic", async () => {
+  fake = await startFakeCdp();
+  const server = createDebugWebServer();
+  const client = new Client({ name: "debug-web-remote-test", version: "0.1.0" });
+  closeables.push(client, server);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+  const filtered = await client.callTool({
+    name: "browser_list_targets",
+    arguments: { cdp_endpoint: fake.endpoint, origin: "https://example.com" },
+  });
+  expect(filtered.structuredContent).toMatchObject({
+    targets: [{ target_id: "remote-page", origin: "https://example.com" }],
+  });
+
+  const opened = await client.callTool({
+    name: "browser_open_session",
+    arguments: { cdp_endpoint: fake.endpoint, target_id: "remote-page" },
+  });
+  expect(opened.isError, JSON.stringify(opened)).not.toBe(true);
+  expect(opened.structuredContent).toMatchObject({
+    origin: "https://example.com",
+    allowed_origins: ["https://example.com"],
+  });
+  const sessionId = (opened.structuredContent as { session_id: string }).session_id;
+
+  const started = await client.callTool({
+    name: "browser_start_capture",
+    arguments: { session_id: sessionId },
+  });
+  expect(started.isError).not.toBe(true);
+  const stopped = await client.callTool({
+    name: "browser_stop_capture",
+    arguments: { session_id: sessionId },
+  });
+  expect(stopped.isError).not.toBe(true);
+
+  const request = await client.callTool({
+    name: "browser_get_network_request",
+    arguments: { session_id: sessionId, request_id: "request-remote" },
+  });
+  expect(request.structuredContent).toMatchObject({
+    url: "https://example.com/api/items",
+    status: 201,
+  });
+
+  await client.callTool({
+    name: "browser_close_session",
+    arguments: { session_id: sessionId },
+  });
 });

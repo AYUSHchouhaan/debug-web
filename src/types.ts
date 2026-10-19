@@ -15,6 +15,17 @@ export interface DebugWebRequest {
   readonly failure: string | null;
 }
 
+export interface NetworkRequestSummary {
+  readonly request_id: string;
+  readonly method: string;
+  readonly url: string;
+  readonly status: number | null;
+  readonly resource_type: string | null;
+  readonly mime_type: string | null;
+  readonly duration_ms: number | null;
+  readonly response_body_state: DebugWebRequest["response_body_state"];
+}
+
 export interface DebugWebEvent {
   readonly sequence: number;
   readonly type: string;

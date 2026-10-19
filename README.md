@@ -1,8 +1,8 @@
 # Debug Web MCP
 
-Debug Web is a standalone MCP server for inspecting web pages through Chrome DevTools Protocol (CDP). It runs independently of REA and does not install, import, or execute REA.
+Debug Web is a standalone MCP server that launches a Chrome-family browser itself, attaches over CDP, and captures network/console/navigation/WebSocket activity automatically. It runs independently of REA and does not install, import, or execute REA.
 
-It exposes nine tools for listing Chrome page targets, attaching to one selected page, capturing network/console/navigation/WebSocket events, inspecting the page DOM, querying captured requests/events, stopping capture, and discarding a session. It intentionally has no screenshot tool.
+It exposes eight tools: launch or attach to a browser, list page targets, read the page DOM, page through a lean request list, fetch in-depth detail for one or more requests, read events, and close the session. It intentionally has no screenshot tool and no browser automation.
 
 Use it only against pages you own or are explicitly authorized to debug.
 
@@ -29,9 +29,11 @@ npm run dev
 
 The built executable is `node dist/main.js`; when installed from npm the command will be `debug-web`.
 
-## Start Chrome
+## Start a browser
 
-Use a dedicated browser profile and bind the CDP port to loopback. Open any page you are authorized to inspect (localhost or remote). Example on Windows PowerShell:
+You normally do not start Chrome yourself. `browser_launch` starts a disposable Chrome-family browser with a temporary profile on a loopback debugging port, opens the URL you pass, attaches, and begins capturing. If Chrome is not found automatically, pass `executable_path` or set `DEBUG_WEB_BROWSER` to the browser executable.
+
+To attach to a browser you started yourself instead, launch it with a dedicated profile and a loopback port, then use `browser_list_targets` and `browser_open_session`:
 
 ```powershell
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
@@ -79,24 +81,27 @@ Restart Claude Code or reconnect its MCP servers. Other stdio-capable MCP client
 
 ## Typical workflow
 
-1. Call `browser_list_targets` with `cdp_endpoint: "http://127.0.0.1:9222"` (optionally with an `origin` filter).
-2. Call `browser_open_session` with the selected `target_id`. The page's own origin is captured automatically, whether it is localhost or a remote host.
-3. If the page talks to other hosts (for example a separate API or CDN), add their exact origins in `allowed_origins`, e.g. `["https://api.example.com"]`.
-4. Call `browser_start_capture`, then use the page normally in Chrome.
-5. Call `browser_stop_capture`; query details with `browser_list_network_requests`, `browser_get_network_request`, and `browser_get_events`.
-6. Call `browser_get_dom` for a read-only DOM snapshot; attribute values and text are opt-in.
-7. Call `browser_close_session` to discard session data and detach.
+1. Call `browser_launch` with `url` (the page to open). It starts a disposable browser, opens the page, attaches, and starts capturing — there is no separate "start capture" step. Add exact extra origins in `allowed_origins` if the page talks to other hosts, e.g. `["https://api.example.com"]`.
+2. Use the page; activity is captured automatically.
+3. Call `browser_list_network_requests` for a lean, paged overview (`limit`, `offset`, `resource_type`). It returns ids, method, url, status, type, mime, duration, and body state — no headers or bodies.
+4. Call `browser_get_network_requests` with up to 20 `request_ids` for full detail: redacted headers, request payload, and response body.
+5. Call `browser_get_events` for the event log, and `browser_get_dom` for a read-only DOM snapshot (attribute values and text are opt-in).
+6. Call `browser_close_session` to discard session data; if Debug Web launched the browser, it is stopped and its profile deleted.
+
+To attach to a browser you started yourself, use `browser_list_targets` then `browser_open_session` (same automatic capture).
 
 ## Scope and data handling
 
 - **Endpoint stays loopback:** the CDP endpoint must be explicit-port HTTP on `localhost`, `127.0.0.1`, or `[::1]`. Never expose the debugging port to an untrusted network.
-- **Authorized page scope:** the selected page's origin is auto-authorized whether local or remote. Additional origins must be exact HTTP(S) origins supplied at session open. Navigating outside the authorized scope stops capture.
-- **Use only with authorization:** attach only to pages you own or are permitted to debug.
-- **DOM inspection is read-only and bounded:** `browser_get_dom` uses CDP `DOM.getDocument` and never evaluates JavaScript. It returns node names, types, parents, and attribute names by default; `include_attribute_values` and `include_text` are opt-in, and node/byte limits are reported when exceeded.
-- **Bodies off by default:** request and response bodies are captured only when explicitly enabled. Body size is bounded per request and per session; non-text/non-JSON response bodies are not retrieved.
-- **Header redaction:** authorization, cookie, API-key, and CSRF headers are redacted. Query strings, DOM text/attribute values, and explicitly enabled body contents are not heuristically scrubbed and may contain secrets.
+- **Disposable browser:** `browser_launch` uses a temporary profile, pins the debug port to loopback, and stops only the browser it launched. A browser you started yourself is never closed.
+- **Authorized page scope:** the selected page's origin is auto-authorized whether local or remote. Additional origins must be exact HTTP(S) origins supplied at launch/session open. Navigating outside the authorized scope stops capture.
+- **Use only with authorization:** inspect only pages you own or are permitted to debug.
+- **Capture is always on:** network, console, navigation, WebSocket, and DOM-capable domains are enabled when the session opens; there is no start/stop toggle.
+- **Lean list, deep detail:** `browser_list_network_requests` omits headers and bodies to keep context small; `browser_get_network_requests` returns them.
+- **Bodies are bounded:** request payloads and text/JSON response bodies are captured automatically, up to 1 MiB per body and 32 MiB per session; anything larger reports `over_limit`. Non-text/non-JSON response bodies are not retrieved.
+- **Header redaction:** authorization, cookie, API-key, and CSRF headers are redacted. Query strings, DOM text/attribute values, and captured body contents are not heuristically scrubbed and may contain secrets.
+- **DOM inspection is read-only:** `browser_get_dom` uses CDP `DOM.getDocument` and never evaluates JavaScript.
 - **Ephemeral:** records stay in process memory and are discarded when the session closes or the server exits. Tool results may still remain in the connected agent’s conversation history.
-- **Browser ownership:** Debug Web never closes Chrome or a tab. It disables the CDP domains it enabled and closes only its own WebSocket connection.
 
 ## Development checks
 

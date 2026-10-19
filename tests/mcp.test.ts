@@ -13,7 +13,19 @@ afterEach(async () => {
   fake = undefined;
 });
 
-it("runs the isolated localhost MCP workflow with bounded ephemeral captures", async () => {
+const delay = async (milliseconds: number): Promise<void> =>
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const waitFor = async <T>(produce: () => Promise<T | undefined>): Promise<T> => {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const value = await produce();
+    if (value !== undefined) return value;
+    await delay(20);
+  }
+  throw new Error("Timed out waiting for captured requests.");
+};
+
+it("auto-captures on open and serves lean lists with in-depth multi-request detail", async () => {
   fake = await startFakeCdp();
   const server = createDebugWebServer();
   const client = new Client({ name: "debug-web-test", version: "0.1.0" });
@@ -26,12 +38,11 @@ it("runs the isolated localhost MCP workflow with bounded ephemeral captures", a
     "browser_close_session",
     "browser_get_dom",
     "browser_get_events",
-    "browser_get_network_request",
+    "browser_get_network_requests",
+    "browser_launch",
     "browser_list_network_requests",
     "browser_list_targets",
     "browser_open_session",
-    "browser_start_capture",
-    "browser_stop_capture",
   ]);
   expect(catalog.tools.some(({ name }) => name.includes("screenshot"))).toBe(false);
 
@@ -55,58 +66,63 @@ it("runs the isolated localhost MCP workflow with bounded ephemeral captures", a
       allowed_origins: ["http://127.0.0.1:4100"],
     },
   });
-  expect(opened.isError).not.toBe(true);
+  expect(opened.isError, JSON.stringify(opened)).not.toBe(true);
   const sessionId = (opened.structuredContent as { session_id: string }).session_id;
 
-  const defaults = await import("../src/server.js").then(({ debugWebStartCaptureInputSchema }) =>
-    debugWebStartCaptureInputSchema.parse({ session_id: sessionId }),
-  );
-  expect(defaults.capture_request_bodies).toBe(false);
-  expect(defaults.capture_response_bodies).toBe(false);
-
-  const started = await client.callTool({
-    name: "browser_start_capture",
-    arguments: {
-      session_id: sessionId,
-      capture_request_bodies: true,
-      capture_response_bodies: true,
-    },
+  // Capture is automatic: no start/stop call, requests appear on their own.
+  const full = await waitFor(async () => {
+    const response = await client.callTool({
+      name: "browser_get_network_requests",
+      arguments: { session_id: sessionId, request_ids: ["request-1", "request-2"] },
+    });
+    const content = response.structuredContent as {
+      requests: ReadonlyArray<{ request_id: string; response_body_state: string }>;
+    };
+    return content.requests.length === 2 &&
+      content.requests.every((item) => item.response_body_state === "available")
+      ? content
+      : undefined;
   });
-  expect(started.isError).not.toBe(true);
 
-  const stopped = await client.callTool({
-    name: "browser_stop_capture",
+  const lean = await client.callTool({
+    name: "browser_list_network_requests",
     arguments: { session_id: sessionId },
   });
-  expect(stopped.isError).not.toBe(true);
-  expect(fake.commands).toEqual(
-    expect.arrayContaining([
-      "Page.enable",
-      "Runtime.enable",
-      "Network.enable",
-      "Network.getResponseBody",
-    ]),
-  );
+  const leanContent = lean.structuredContent as {
+    total: number;
+    requests: ReadonlyArray<Record<string, unknown>>;
+  };
+  expect(leanContent.total).toBe(2);
+  expect(leanContent.requests.map((item) => item.request_id)).toEqual(["request-1", "request-2"]);
+  for (const item of leanContent.requests) {
+    expect(item).not.toHaveProperty("request_headers");
+    expect(item).not.toHaveProperty("response_headers");
+    expect(item).not.toHaveProperty("request_body");
+    expect(item).not.toHaveProperty("response_body");
+  }
 
-  const request = await client.callTool({
-    name: "browser_get_network_request",
-    arguments: { session_id: sessionId, request_id: "request-1" },
-  });
-  const serialized = JSON.stringify(request.structuredContent);
+  const serialized = JSON.stringify(full);
   expect(serialized).toContain("[REDACTED]");
   expect(serialized).not.toContain("Bearer hidden");
-  const captured = request.structuredContent as {
-    request_body: string;
-    response_body: string | null;
-    response_body_state: string;
+  const api = full.requests.find((item) => item.request_id === "request-1") as unknown as {
     url: string;
     status: number;
+    request_body: string;
+    response_body: string;
   };
-  expect(captured.url).toBe("http://127.0.0.1:4100/api/items");
-  expect(captured.status).toBe(201);
-  expect(JSON.parse(captured.request_body)).toEqual({ item: "book", token: "caller-data" });
-  expect(captured.response_body_state).toBe("available");
-  expect(JSON.parse(captured.response_body ?? "")).toEqual({ ok: true, token: "body-secret" });
+  expect(api.url).toBe("http://127.0.0.1:4100/api/items");
+  expect(api.status).toBe(201);
+  expect(JSON.parse(api.request_body)).toEqual({ item: "book", token: "caller-data" });
+  expect(JSON.parse(api.response_body)).toMatchObject({ ok: true, token: "body-secret" });
+
+  const withMissing = await client.callTool({
+    name: "browser_get_network_requests",
+    arguments: { session_id: sessionId, request_ids: ["request-1", "nope"] },
+  });
+  expect(withMissing.structuredContent).toMatchObject({ missing: ["nope"] });
+  expect((withMissing.structuredContent as { requests: readonly unknown[] }).requests).toHaveLength(
+    1,
+  );
 
   const closed = await client.callTool({
     name: "browser_close_session",
@@ -167,25 +183,17 @@ it("auto-scopes a remote page origin and captures its same-origin traffic", asyn
   });
   const sessionId = (opened.structuredContent as { session_id: string }).session_id;
 
-  const started = await client.callTool({
-    name: "browser_start_capture",
-    arguments: { session_id: sessionId },
+  const request = await waitFor(async () => {
+    const response = await client.callTool({
+      name: "browser_get_network_requests",
+      arguments: { session_id: sessionId, request_ids: ["request-remote"] },
+    });
+    const content = response.structuredContent as {
+      requests: ReadonlyArray<{ url: string; status: number }>;
+    };
+    return content.requests.length === 1 ? content.requests[0] : undefined;
   });
-  expect(started.isError).not.toBe(true);
-  const stopped = await client.callTool({
-    name: "browser_stop_capture",
-    arguments: { session_id: sessionId },
-  });
-  expect(stopped.isError).not.toBe(true);
-
-  const request = await client.callTool({
-    name: "browser_get_network_request",
-    arguments: { session_id: sessionId, request_id: "request-remote" },
-  });
-  expect(request.structuredContent).toMatchObject({
-    url: "https://example.com/api/items",
-    status: 201,
-  });
+  expect(request).toMatchObject({ url: "https://example.com/api/items", status: 201 });
 
   await client.callTool({
     name: "browser_close_session",

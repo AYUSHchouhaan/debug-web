@@ -32,10 +32,6 @@ export interface DebugWebSession {
   readonly requests: Map<string, MutableRequest>;
   readonly events: DebugWebEvent[];
   readonly pendingBodyReads: Set<Promise<void>>;
-  captureTimer: NodeJS.Timeout | undefined;
-  capture: boolean;
-  captureRequestBodies: boolean;
-  captureResponseBodies: boolean;
   maxBodyBytes: number;
   totalBodyBytes: number;
   sequence: number;
@@ -44,6 +40,8 @@ export interface DebugWebSession {
 
 const SECRET_HEADER =
   /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-csrf-token)$/iu;
+const DEFAULT_MAX_BODY_BYTES = 1_048_576;
+const MAX_TOTAL_BODY_BYTES = 32 * 1024 * 1024;
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -94,11 +92,7 @@ export class DebugWebSessionStore {
       requests: new Map(),
       events: [],
       pendingBodyReads: new Set(),
-      captureTimer: undefined,
-      capture: false,
-      captureRequestBodies: false,
-      captureResponseBodies: false,
-      maxBodyBytes: 262_144,
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
       totalBodyBytes: 0,
       sequence: 0,
       closed: false,
@@ -106,7 +100,6 @@ export class DebugWebSessionStore {
     session.removeEventListener = connection.onEvent((event) => this.ingest(session, event));
     connection.onDisconnect(() => {
       session.closed = true;
-      session.capture = false;
     });
     this.#sessions.set(session.session_id, session);
     return session;
@@ -117,11 +110,6 @@ export class DebugWebSessionStore {
   }
 
   async stopCapture(session: DebugWebSession): Promise<void> {
-    session.capture = false;
-    if (session.captureTimer !== undefined) {
-      clearTimeout(session.captureTimer);
-      session.captureTimer = undefined;
-    }
     await Promise.allSettled(session.pendingBodyReads);
   }
 
@@ -164,7 +152,7 @@ export class DebugWebSessionStore {
   }
 
   ingest(session: DebugWebSession, event: CdpEvent): void {
-    if (!session.capture || session.closed) return;
+    if (session.closed) return;
     const params = asRecord(event.params);
     if (params === undefined) return;
     const timestamp = asNumber(params.timestamp);
@@ -249,13 +237,12 @@ export class DebugWebSessionStore {
       request_headers: safeHeaders(request.headers),
       response_headers: {},
       request_body:
-        session.captureRequestBodies &&
         typeof requestBody === "string" &&
         Buffer.byteLength(requestBody, "utf8") <= session.maxBodyBytes
           ? bodyString(requestBody)
           : null,
       response_body: null,
-      response_body_state: session.captureResponseBodies ? "unavailable" : "not_requested",
+      response_body_state: "unavailable",
       initiator_url: safeHttpUrl(asString(frame?.url) ?? "", session.allowedOrigins)?.href ?? null,
       failure: null,
     });
@@ -304,24 +291,22 @@ export class DebugWebSessionStore {
     const request = session.requests.get(requestId);
     if (request === undefined) return;
     request.finish_time = timestamp;
-    if (session.captureResponseBodies) {
-      const expectedBytes = asNumber(params.encodedDataLength);
-      if (
-        expectedBytes === null ||
-        expectedBytes > session.maxBodyBytes ||
-        session.totalBodyBytes + expectedBytes > session.maxBodyBytes * 20
-      ) {
-        request.response_body_state = "over_limit";
-      } else if (
-        request.status !== 204 &&
-        (request.mime_type?.includes("json") === true ||
-          request.mime_type?.startsWith("text/") === true)
-      ) {
-        session.totalBodyBytes += expectedBytes;
-        const pending = this.#captureResponseBody(session, requestId, request, expectedBytes);
-        session.pendingBodyReads.add(pending);
-        void pending.finally(() => session.pendingBodyReads.delete(pending));
-      }
+    const expectedBytes = asNumber(params.encodedDataLength);
+    if (
+      expectedBytes === null ||
+      expectedBytes > session.maxBodyBytes ||
+      session.totalBodyBytes + expectedBytes > MAX_TOTAL_BODY_BYTES
+    ) {
+      request.response_body_state = "over_limit";
+    } else if (
+      request.status !== 204 &&
+      (request.mime_type?.includes("json") === true ||
+        request.mime_type?.startsWith("text/") === true)
+    ) {
+      session.totalBodyBytes += expectedBytes;
+      const pending = this.#captureResponseBody(session, requestId, request, expectedBytes);
+      session.pendingBodyReads.add(pending);
+      void pending.finally(() => session.pendingBodyReads.delete(pending));
     }
     this.#event(session, {
       type: "Network.loadingFinished",
@@ -343,7 +328,6 @@ export class DebugWebSessionStore {
     const url = safeHttpUrl(rawUrl, session.allowedOrigins);
     if (url === undefined) {
       session.closed = true;
-      session.capture = false;
       this.#event(session, {
         type: method,
         timestamp,

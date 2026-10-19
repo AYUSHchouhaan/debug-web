@@ -2,9 +2,12 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 
+import { launchBrowser } from "./browser/launch.js";
+import type { LaunchedBrowser } from "./browser/launch.js";
 import { CdpConnection } from "./cdp/connection.js";
 import { discoverCdpEndpoint, pageSocketForTarget, validateCdpEndpoint } from "./cdp/discovery.js";
 import { captureDomSnapshot } from "./cdp/dom.js";
+import type { CdpTarget } from "./cdp/types.js";
 import {
   buildAllowedOrigins,
   isHttpUrl,
@@ -13,8 +16,8 @@ import {
 } from "./origins.js";
 import { DebugWebSessionStore } from "./sessionStore.js";
 import type { DebugWebSession } from "./sessionStore.js";
+import type { DebugWebRequest, NetworkRequestSummary } from "./types.js";
 
-const MAX_BODY_BYTES = 1_048_576;
 const MAX_DOM_BYTES = 2_000_000;
 const endpointInput = z.strictObject({ cdp_endpoint: z.string().url() });
 const sessionInput = z.strictObject({ session_id: z.string().min(1) });
@@ -38,12 +41,10 @@ const openSessionInput = z.strictObject({
   target_id: z.string().min(1),
   allowed_origins: z.array(exactOriginSchema).max(MAX_ALLOWED_ORIGINS).default([]),
 });
-export const debugWebStartCaptureInputSchema = z.strictObject({
-  session_id: z.string().min(1),
-  duration_ms: z.number().int().min(0).max(300_000).default(0),
-  capture_request_bodies: z.boolean().default(false),
-  capture_response_bodies: z.boolean().default(false),
-  max_body_bytes: z.number().int().min(1).max(MAX_BODY_BYTES).default(262_144),
+export const debugWebLaunchInputSchema = z.strictObject({
+  url: z.string().url().optional(),
+  executable_path: z.string().min(1).optional(),
+  allowed_origins: z.array(exactOriginSchema).max(MAX_ALLOWED_ORIGINS).default([]),
 });
 export const debugWebGetDomInputSchema = z.strictObject({
   session_id: z.string().min(1),
@@ -57,9 +58,9 @@ const listRequestsInput = z.strictObject({
   offset: z.number().int().min(0).default(0),
   resource_type: z.string().optional(),
 });
-const getRequestInput = z.strictObject({
+const getRequestsInput = z.strictObject({
   session_id: z.string().min(1),
-  request_id: z.string().min(1),
+  request_ids: z.array(z.string().min(1)).min(1).max(20),
 });
 const eventQueryInput = z.strictObject({
   session_id: z.string().min(1),
@@ -77,10 +78,98 @@ const failure = (message: string) => ({
 });
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
+const delay = async (milliseconds: number): Promise<void> =>
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const liveSession = (store: DebugWebSessionStore, id: string): DebugWebSession | undefined => {
   const session = store.get(id);
   return session !== undefined && !session.closed ? session : undefined;
+};
+
+const enableObservation = async (connection: CdpConnection): Promise<void> => {
+  await connection.send("Page.enable");
+  await connection.send("Runtime.enable");
+  await connection.send("Network.enable");
+};
+
+const pageTargets = (
+  targets: readonly CdpTarget[],
+): readonly { readonly target: CdpTarget; readonly pageUrl: URL }[] =>
+  targets.flatMap((target) => {
+    const pageUrl = isHttpUrl(target.url);
+    return target.type === "page" && pageUrl !== undefined && target.webSocket !== undefined
+      ? [{ target, pageUrl }]
+      : [];
+  });
+
+const findPageTarget = async (
+  endpoint: URL,
+  url: string | undefined,
+  attempts = 40,
+): Promise<{ readonly target: CdpTarget; readonly pageUrl: URL }> => {
+  const wantedOrigin = url === undefined ? undefined : isHttpUrl(url)?.origin;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const discovered = await discoverCdpEndpoint(endpoint);
+    const pages = pageTargets(discovered.targets);
+    const chosen =
+      pages.find((page) => wantedOrigin !== undefined && page.pageUrl.origin === wantedOrigin) ??
+      pages[0];
+    if (chosen !== undefined) return chosen;
+    await delay(250);
+  }
+  throw new Error("No HTTP(S) page target appeared in the launched browser.");
+};
+
+const registerLaunchTool = (
+  server: McpServer,
+  store: DebugWebSessionStore,
+  browsers: Map<string, LaunchedBrowser>,
+): void => {
+  server.registerTool(
+    "browser_launch",
+    {
+      description:
+        "Launch a disposable Chrome, open the given page, attach, and start capturing automatically. Uses a temporary profile on a loopback debugging port; pass executable_path or set DEBUG_WEB_BROWSER if Chrome is not found. Close the session to stop the browser. Use only for pages you are authorized to debug.",
+      inputSchema: debugWebLaunchInputSchema.shape,
+    },
+    async (raw) => {
+      const input = debugWebLaunchInputSchema.parse(raw);
+      let browser: LaunchedBrowser | undefined;
+      let connection: CdpConnection | undefined;
+      let session: DebugWebSession | undefined;
+      try {
+        browser = await launchBrowser({
+          url: input.url ?? "about:blank",
+          ...(input.executable_path === undefined ? {} : { executablePath: input.executable_path }),
+        });
+        const endpoint = validateCdpEndpoint(browser.endpoint);
+        const { target, pageUrl } = await findPageTarget(endpoint, input.url);
+        const socket = pageSocketForTarget(endpoint, target);
+        connection = await CdpConnection.connect(socket);
+        const allowedOrigins = buildAllowedOrigins(pageUrl.origin, input.allowed_origins);
+        session = store.create(target.id, pageUrl.origin, allowedOrigins, connection);
+        browsers.set(session.session_id, browser);
+        await enableObservation(connection);
+        return result({
+          session_id: session.session_id,
+          cdp_endpoint: endpoint.origin,
+          target_id: session.target_id,
+          origin: session.origin,
+          allowed_origins: [...session.allowedOrigins].sort(),
+          pid: browser.pid ?? null,
+          status: "open",
+        });
+      } catch (cause) {
+        if (session !== undefined) {
+          browsers.delete(session.session_id);
+          await store.close(session.session_id);
+        }
+        if (connection !== undefined) await connection.close();
+        if (browser !== undefined) await browser.close();
+        return failure(errorMessage(cause));
+      }
+    },
+  );
 };
 
 const registerTargetListTool = (server: McpServer): void => {
@@ -88,7 +177,7 @@ const registerTargetListTool = (server: McpServer): void => {
     "browser_list_targets",
     {
       description:
-        "List HTTP(S) page tabs exposed by a loopback Chrome CDP endpoint, optionally filtered to one exact origin. Remote pages are listed only for inspection you are authorized to perform.",
+        "List HTTP(S) page tabs exposed by a loopback Chrome CDP endpoint, optionally filtered to one exact origin. Useful for a browser you started yourself. Inspect only pages you are authorized to debug.",
       inputSchema: listTargetsInput.shape,
     },
     async (raw) => {
@@ -106,22 +195,14 @@ const registerTargetListTool = (server: McpServer): void => {
             product: discovered.browser,
             protocol_version: discovered.protocolVersion,
           },
-          targets: discovered.targets.flatMap((target) => {
-            const url = isHttpUrl(target.url);
-            return target.type === "page" &&
-              url !== undefined &&
-              target.webSocket !== undefined &&
-              (input.origin === undefined || url.origin === input.origin)
-              ? [
-                  {
-                    target_id: target.id,
-                    title: target.title,
-                    url: url.href,
-                    origin: url.origin,
-                  },
-                ]
-              : [];
-          }),
+          targets: pageTargets(discovered.targets)
+            .filter((page) => input.origin === undefined || page.pageUrl.origin === input.origin)
+            .map((page) => ({
+              target_id: page.target.id,
+              title: page.target.title,
+              url: page.pageUrl.href,
+              origin: page.pageUrl.origin,
+            })),
         });
       } catch (cause) {
         return failure(errorMessage(cause));
@@ -135,7 +216,7 @@ const registerOpenSessionTool = (server: McpServer, store: DebugWebSessionStore)
     "browser_open_session",
     {
       description:
-        "Attach to one selected HTTP(S) page and scope capture to its current origin. Add exact extra origins (for example an API or CDN host) when the page talks to them. Inspect only pages you are authorized to debug; Chrome and tabs remain user-owned.",
+        "Attach to a page of an already-running Chrome on a loopback CDP endpoint and start capturing automatically, scoped to the page's current origin plus any exact extra origins. Use browser_launch instead to start a browser for you.",
       inputSchema: openSessionInput.shape,
     },
     async (raw) => {
@@ -158,6 +239,13 @@ const registerOpenSessionTool = (server: McpServer, store: DebugWebSessionStore)
         const connection = await CdpConnection.connect(socket);
         const allowedOrigins = buildAllowedOrigins(url.origin, input.allowed_origins);
         const session = store.create(target.id, url.origin, allowedOrigins, connection);
+        try {
+          await enableObservation(connection);
+        } catch (cause) {
+          await store.close(session.session_id);
+          await connection.close();
+          throw cause;
+        }
         return result({
           session_id: session.session_id,
           target_id: session.target_id,
@@ -172,86 +260,32 @@ const registerOpenSessionTool = (server: McpServer, store: DebugWebSessionStore)
   );
 };
 
-const registerCaptureTools = (server: McpServer, store: DebugWebSessionStore): void => {
-  server.registerTool(
-    "browser_start_capture",
-    {
-      description:
-        "Capture network, console, navigation, and WebSocket events. Request and response bodies default off; when requested, text/JSON bodies are size-bounded and held only in memory.",
-      inputSchema: debugWebStartCaptureInputSchema.shape,
-    },
-    async (raw) => {
-      const input = debugWebStartCaptureInputSchema.parse(raw);
-      const session = liveSession(store, input.session_id);
-      if (session === undefined) return failure("Session is missing or its tab closed.");
-      if (session.capture) return failure("Capture is already running.");
-      try {
-        session.capture = true;
-        session.captureRequestBodies = input.capture_request_bodies;
-        session.captureResponseBodies = input.capture_response_bodies;
-        session.maxBodyBytes = input.max_body_bytes;
-        session.totalBodyBytes = 0;
-        await session.connection.send("Page.enable");
-        await session.connection.send("Runtime.enable");
-        await session.connection.send("Network.enable");
-        if (input.duration_ms > 0) {
-          session.captureTimer = setTimeout(() => {
-            void store.stopCapture(session);
-          }, input.duration_ms);
-          session.captureTimer.unref();
-        }
-        return result({
-          session_id: session.session_id,
-          status: "capturing",
-          duration_ms: input.duration_ms || null,
-        });
-      } catch (cause) {
-        session.capture = false;
-        await disableDomains(session);
-        return failure(errorMessage(cause));
-      }
-    },
-  );
-
-  server.registerTool(
-    "browser_stop_capture",
-    {
-      description: "Stop capture and return a summary of temporary event data.",
-      inputSchema: sessionInput.shape,
-    },
-    async (raw) => {
-      const input = sessionInput.parse(raw);
-      const session = store.get(input.session_id);
-      if (session === undefined) return failure("Session not found.");
-      await store.stopCapture(session);
-      const requests = store.requests(session);
-      return result({
-        session_id: session.session_id,
-        status: session.closed ? "target_closed" : "stopped",
-        request_count: requests.length,
-        failed_request_count: requests.filter((item) => item.failure !== null).length,
-        navigation_count: session.events.filter((event) => event.type.startsWith("Page.")).length,
-        console_event_count: session.events.filter(
-          (event) => event.type === "Runtime.consoleAPICalled",
-        ).length,
-        requests: requests.slice(0, 100).map(withoutBodies),
-        truncated: requests.length > 100,
-      });
-    },
-  );
-};
-
-const withoutBodies = ({
-  request_body: _requestBody,
-  response_body: _responseBody,
-  ...metadata
-}: ReturnType<DebugWebSessionStore["requests"]>[number]) => metadata;
+const summaryOf = ({
+  request_id,
+  method,
+  url,
+  status,
+  resource_type,
+  mime_type,
+  duration_ms,
+  response_body_state,
+}: DebugWebRequest): NetworkRequestSummary => ({
+  request_id,
+  method,
+  url,
+  status,
+  resource_type,
+  mime_type,
+  duration_ms,
+  response_body_state,
+});
 
 const registerQueryTools = (server: McpServer, store: DebugWebSessionStore): void => {
   server.registerTool(
     "browser_list_network_requests",
     {
-      description: "Query captured network metadata in memory; does not call Chrome.",
+      description:
+        "Lean, paged list of captured requests (id, method, url, status, type, mime, duration, body state). No headers or bodies, so it stays small in context. Use browser_get_network_requests for full detail.",
       inputSchema: listRequestsInput.shape,
     },
     async (raw) => {
@@ -267,24 +301,30 @@ const registerQueryTools = (server: McpServer, store: DebugWebSessionStore): voi
       return result({
         total: requests.length,
         offset: input.offset,
-        requests: requests.slice(input.offset, input.offset + input.limit).map(withoutBodies),
+        requests: requests.slice(input.offset, input.offset + input.limit).map(summaryOf),
       });
     },
   );
 
   server.registerTool(
-    "browser_get_network_request",
+    "browser_get_network_requests",
     {
       description:
-        "Read one captured request with redacted headers and opted-in bodies from memory; does not call Chrome.",
-      inputSchema: getRequestInput.shape,
+        "Read one or more captured requests in depth from memory: redacted headers, request payload, and response body. Pass up to 20 request_ids. Does not call Chrome.",
+      inputSchema: getRequestsInput.shape,
     },
     async (raw) => {
-      const input = getRequestInput.parse(raw);
+      const input = getRequestsInput.parse(raw);
       const session = store.get(input.session_id);
       if (session === undefined) return failure("Session not found.");
-      const request = store.requests(session).find((item) => item.request_id === input.request_id);
-      return request === undefined ? failure("Request not found.") : result(request);
+      const byId = new Map(store.requests(session).map((request) => [request.request_id, request]));
+      return result({
+        requests: input.request_ids.flatMap((id) => {
+          const request = byId.get(id);
+          return request === undefined ? [] : [request];
+        }),
+        missing: input.request_ids.filter((id) => !byId.has(id)),
+      });
     },
   );
 
@@ -303,29 +343,6 @@ const registerQueryTools = (server: McpServer, store: DebugWebSessionStore): voi
         total: session.events.length,
         offset: input.offset,
         events: session.events.slice(input.offset, input.offset + input.limit),
-      });
-    },
-  );
-};
-
-const registerCloseTool = (server: McpServer, store: DebugWebSessionStore): void => {
-  server.registerTool(
-    "browser_close_session",
-    {
-      description:
-        "Detach, close only Debug Web's socket, and discard temporary data; leaves Chrome and the tab open.",
-      inputSchema: sessionInput.shape,
-    },
-    async (raw) => {
-      const input = sessionInput.parse(raw);
-      const session = await store.close(input.session_id);
-      if (session === undefined) return failure("Session not found.");
-      await disableDomains(session);
-      await session.connection.close();
-      return result({
-        session_id: session.session_id,
-        status: "closed",
-        temporary_data_discarded: true,
       });
     },
   );
@@ -358,38 +375,77 @@ const registerGetDomTool = (server: McpServer, store: DebugWebSessionStore): voi
   );
 };
 
-export const createDebugWebServer = (store = new DebugWebSessionStore()): McpServer => {
+const registerCloseTool = (
+  server: McpServer,
+  store: DebugWebSessionStore,
+  browsers: Map<string, LaunchedBrowser>,
+): void => {
+  server.registerTool(
+    "browser_close_session",
+    {
+      description:
+        "Detach, discard temporary data, and close only Debug Web's socket. If Debug Web launched the browser, that browser is stopped and its temporary profile deleted; a browser you started yourself is left running.",
+      inputSchema: sessionInput.shape,
+    },
+    async (raw) => {
+      const input = sessionInput.parse(raw);
+      const owned = browsers.get(input.session_id);
+      const session = await store.close(input.session_id);
+      if (session === undefined && owned === undefined) return failure("Session not found.");
+      if (session !== undefined) {
+        await disableDomains(session);
+        await session.connection.close();
+      }
+      if (owned !== undefined) {
+        browsers.delete(input.session_id);
+        await owned.close();
+      }
+      return result({
+        session_id: input.session_id,
+        status: "closed",
+        temporary_data_discarded: true,
+        browser_stopped: owned !== undefined,
+      });
+    },
+  );
+};
+
+export const createDebugWebServer = (
+  store = new DebugWebSessionStore(),
+  browsers = new Map<string, LaunchedBrowser>(),
+): McpServer => {
   const server = new McpServer(
     { name: "debug-web", version: "1.0.0" },
     {
       instructions:
-        "Debug Web inspects HTTP(S) web pages you own or are authorized to debug. The selected page's origin is captured by default; add exact extra origins when the page talks to other hosts. Network, console, navigation, and WebSocket captures stay in process memory and are deleted on session/process closure. Credentials are redacted. Screenshots are not provided.",
+        "Debug Web launches a disposable Chrome (or attaches to one you started) and captures network, console, navigation, and WebSocket activity automatically. Call browser_launch, then browser_list_network_requests for a lean overview and browser_get_network_requests for full detail. Inspect only pages you are authorized to debug. Captures stay in process memory and are deleted on session/process closure; credentials are redacted. Screenshots are not provided.",
     },
   );
+  registerLaunchTool(server, store, browsers);
   registerTargetListTool(server);
   registerOpenSessionTool(server, store);
-  registerCaptureTools(server, store);
   registerGetDomTool(server, store);
   registerQueryTools(server, store);
-  registerCloseTool(server, store);
+  registerCloseTool(server, store, browsers);
   return server;
 };
 
 export const runDebugWeb = async (): Promise<void> => {
   const store = new DebugWebSessionStore();
-  const handle = serveStdio(() => createDebugWebServer(store));
+  const browsers = new Map<string, LaunchedBrowser>();
+  const handle = serveStdio(() => createDebugWebServer(store, browsers));
   const close = (): void => {
-    void store
-      .closeAll()
-      .then(async (sessions) => {
-        await Promise.all(
-          sessions.map(async (session) => {
-            await disableDomains(session);
-            await session.connection.close();
-          }),
-        );
-      })
-      .finally(() => void handle.close());
+    void (async () => {
+      const sessions = await store.closeAll();
+      await Promise.all(
+        sessions.map(async (session) => {
+          await disableDomains(session);
+          await session.connection.close();
+        }),
+      );
+      await Promise.all([...browsers.values()].map(async (browser) => await browser.close()));
+      browsers.clear();
+    })().finally(() => void handle.close());
   };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);

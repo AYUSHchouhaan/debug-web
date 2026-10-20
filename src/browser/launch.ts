@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ const STOP_TIMEOUT_MS = 2_000;
 export interface LaunchedBrowser {
   readonly endpoint: string;
   readonly profileDir: string;
+  readonly persistent: boolean;
   readonly pid: number | undefined;
   readonly close: () => Promise<void>;
 }
@@ -19,6 +20,7 @@ export interface LaunchedBrowser {
 export interface LaunchBrowserOptions {
   readonly url: string;
   readonly executablePath?: string;
+  readonly userDataDir?: string;
 }
 
 export interface LaunchBrowserDependencies {
@@ -74,7 +76,9 @@ const waitForPort = async (
     if (port !== undefined) return port;
     await delay(pollIntervalMs);
   }
-  throw new Error("Browser did not expose a DevTools port before the timeout.");
+  throw new Error(
+    "Browser did not expose a DevTools port before the timeout (is another Chrome already using this profile?).",
+  );
 };
 
 const stopProcess = async (child: ChildProcess): Promise<void> => {
@@ -104,9 +108,14 @@ const stopProcess = async (child: ChildProcess): Promise<void> => {
   });
 };
 
-const stopBrowser = async (child: ChildProcess, profileDir: string): Promise<void> => {
+const stopBrowser = async (
+  child: ChildProcess,
+  profileDir: string,
+  persistent: boolean,
+): Promise<void> => {
   await stopProcess(child);
-  await rm(profileDir, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+  if (!persistent)
+    await rm(profileDir, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
 };
 
 /** Launch a disposable Chrome and wait until its CDP endpoint is ready. */
@@ -120,8 +129,11 @@ export const launchBrowser = async (
     dependencies.env ?? process.env,
     dependencies.exists,
   );
-  const profileDir = await mkdtemp(join(tmpdir(), "debug-web-"));
-  await chmod(profileDir, 0o700);
+  const persistent = options.userDataDir !== undefined;
+  const profileDir = options.userDataDir ?? (await mkdtemp(join(tmpdir(), "debug-web-")));
+  if (persistent) await mkdir(profileDir, { recursive: true, mode: 0o700 });
+  else await chmod(profileDir, 0o700);
+  await rm(join(profileDir, "DevToolsActivePort"), { force: true });
   const child = spawnProcess(executable, browserArguments(profileDir, options.url), {
     detached: process.platform !== "win32",
     stdio: "ignore",
@@ -137,11 +149,12 @@ export const launchBrowser = async (
     return {
       endpoint: `http://127.0.0.1:${String(port)}`,
       profileDir,
+      persistent,
       pid: child.pid,
-      close: async () => await stopBrowser(child, profileDir),
+      close: async () => await stopBrowser(child, profileDir, persistent),
     };
   } catch (cause) {
-    await stopBrowser(child, profileDir);
+    await stopBrowser(child, profileDir, persistent);
     throw cause;
   }
 };

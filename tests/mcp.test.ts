@@ -93,6 +93,11 @@ it("auto-captures on open and serves lean lists with in-depth multi-request deta
     requests: ReadonlyArray<Record<string, unknown>>;
   };
   expect(leanContent.total).toBe(2);
+  const emptyFilter = await client.callTool({
+    name: "browser_list_network_requests",
+    arguments: { session_id: sessionId, resource_type: "" },
+  });
+  expect((emptyFilter.structuredContent as { total: number }).total).toBe(2);
   expect(leanContent.requests.map((item) => item.request_id)).toEqual(["request-1", "request-2"]);
   for (const item of leanContent.requests) {
     expect(item).not.toHaveProperty("request_headers");
@@ -199,4 +204,54 @@ it("auto-scopes a remote page origin and captures its same-origin traffic", asyn
     name: "browser_close_session",
     arguments: { session_id: sessionId },
   });
+});
+
+it("reports why a session closed when navigation leaves the allowed origins", async () => {
+  fake = await startFakeCdp();
+  const server = createDebugWebServer();
+  const client = new Client({ name: "debug-web-scope-test", version: "0.1.0" });
+  closeables.push(client, server);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+  const opened = await client.callTool({
+    name: "browser_open_session",
+    arguments: { cdp_endpoint: fake.endpoint, target_id: "remote-page" },
+  });
+  const sessionId = (opened.structuredContent as { session_id: string }).session_id;
+
+  fake.navigateAway("remote-page", "https://other.example/");
+
+  const closed = await waitFor(async () => {
+    const response = await client.callTool({
+      name: "browser_list_network_requests",
+      arguments: { session_id: sessionId },
+    });
+    const content = response.structuredContent as {
+      closed: boolean;
+      close_reason: string | null;
+    };
+    return content.closed ? content : undefined;
+  });
+  expect(closed.close_reason).toBe("navigation left the authorized origins");
+
+  const dom = await client.callTool({
+    name: "browser_get_dom",
+    arguments: { session_id: sessionId },
+  });
+  expect(dom.isError).toBe(true);
+  const message = JSON.stringify(dom.content);
+  expect(message).toContain("navigation left the authorized origins");
+  expect(message).toContain("https://other.example/");
+});
+
+it("requires a url to launch a browser", async () => {
+  const server = createDebugWebServer();
+  const client = new Client({ name: "debug-web-launch-test", version: "0.1.0" });
+  closeables.push(client, server);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+  const result = await client.callTool({ name: "browser_launch", arguments: {} });
+  expect(result.isError).toBe(true);
 });

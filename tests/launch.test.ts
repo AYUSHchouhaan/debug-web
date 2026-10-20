@@ -106,10 +106,40 @@ it("launches a disposable browser and stops it on close", async () => {
   );
   expect(launched.endpoint).toBe("http://127.0.0.1:52341");
   expect(launched.pid).toBe(4321);
+  expect(launched.persistent).toBe(false);
   expect(profileDir).toBeDefined();
   expect(existsSync(join(profileDir ?? "missing", "DevToolsActivePort"))).toBe(true);
 
   await launched.close();
   expect(child.killed).toBe(true);
   expect(existsSync(profileDir ?? "missing")).toBe(false);
+});
+
+it("keeps a persistent user data directory on close", async () => {
+  const child = makeFakeChild(4322);
+  const base = await mkdtemp(join(tmpdir(), "debug-web-persistent-"));
+  const profileDir = join(base, "nested", "profile");
+  try {
+    const launched = await launchBrowser(
+      { url: "https://example.com/", executablePath: process.execPath, userDataDir: profileDir },
+      {
+        exists: () => true,
+        spawnProcess: (_command, args) => {
+          const dir = args
+            .find((arg) => arg.startsWith("--user-data-dir="))
+            ?.slice("--user-data-dir=".length);
+          if (dir !== undefined)
+            writeFileSync(join(dir, "DevToolsActivePort"), "52342\n/devtools/browser/x\n");
+          return child as unknown as ChildProcess;
+        },
+      },
+    );
+    expect(launched.persistent).toBe(true);
+    expect(launched.profileDir).toBe(profileDir);
+    await launched.close();
+    expect(child.killed).toBe(true);
+    expect(existsSync(profileDir)).toBe(true);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
 });

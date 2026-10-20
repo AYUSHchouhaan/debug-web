@@ -36,6 +36,8 @@ export interface DebugWebSession {
   totalBodyBytes: number;
   sequence: number;
   closed: boolean;
+  closeReason: string | null;
+  closedUrl: string | null;
 }
 
 const SECRET_HEADER =
@@ -96,10 +98,13 @@ export class DebugWebSessionStore {
       totalBodyBytes: 0,
       sequence: 0,
       closed: false,
+      closeReason: null,
+      closedUrl: null,
     };
     session.removeEventListener = connection.onEvent((event) => this.ingest(session, event));
     connection.onDisconnect(() => {
       session.closed = true;
+      session.closeReason ??= "the DevTools connection closed";
     });
     this.#sessions.set(session.session_id, session);
     return session;
@@ -328,6 +333,8 @@ export class DebugWebSessionStore {
     const url = safeHttpUrl(rawUrl, session.allowedOrigins);
     if (url === undefined) {
       session.closed = true;
+      session.closeReason = "navigation left the authorized origins";
+      session.closedUrl = rawUrl === "" ? null : rawUrl;
       this.#event(session, {
         type: method,
         timestamp,

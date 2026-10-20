@@ -1,3 +1,5 @@
+import { isAbsolute } from "node:path";
+
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
@@ -19,6 +21,8 @@ import type { DebugWebSession } from "./sessionStore.js";
 import type { DebugWebRequest, NetworkRequestSummary } from "./types.js";
 
 const MAX_DOM_BYTES = 2_000_000;
+const CAPTURE_NOTE =
+  "Capture starts now. Reload the page to record requests that already happened.";
 const endpointInput = z.strictObject({ cdp_endpoint: z.string().url() });
 const sessionInput = z.strictObject({ session_id: z.string().min(1) });
 const exactOriginSchema = z.string().transform((value, context) => {
@@ -42,8 +46,15 @@ const openSessionInput = z.strictObject({
   allowed_origins: z.array(exactOriginSchema).max(MAX_ALLOWED_ORIGINS).default([]),
 });
 export const debugWebLaunchInputSchema = z.strictObject({
-  url: z.string().url().optional(),
+  url: z.string().url(),
   executable_path: z.string().min(1).optional(),
+  user_data_dir: z
+    .string()
+    .min(1)
+    .refine((value) => isAbsolute(value), {
+      message: "user_data_dir must be an absolute path.",
+    })
+    .optional(),
   allowed_origins: z.array(exactOriginSchema).max(MAX_ALLOWED_ORIGINS).default([]),
 });
 export const debugWebGetDomInputSchema = z.strictObject({
@@ -56,7 +67,13 @@ const listRequestsInput = z.strictObject({
   session_id: z.string().min(1),
   limit: z.number().int().min(1).max(500).default(100),
   offset: z.number().int().min(0).default(0),
-  resource_type: z.string().optional(),
+  resource_type: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const trimmed = value?.trim() ?? "";
+      return trimmed === "" ? undefined : trimmed;
+    }),
 });
 const getRequestsInput = z.strictObject({
   session_id: z.string().min(1),
@@ -81,10 +98,12 @@ const errorMessage = (cause: unknown): string =>
 const delay = async (milliseconds: number): Promise<void> =>
   await new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-const liveSession = (store: DebugWebSessionStore, id: string): DebugWebSession | undefined => {
-  const session = store.get(id);
-  return session !== undefined && !session.closed ? session : undefined;
-};
+const closedMessage = (session: DebugWebSession): string =>
+  session.closeReason === null
+    ? "Session is closed."
+    : `Session closed: ${session.closeReason}${
+        session.closedUrl === null ? "" : ` (${session.closedUrl})`
+      }. Re-open a session to continue capturing.`;
 
 const enableObservation = async (connection: CdpConnection): Promise<void> => {
   await connection.send("Page.enable");
@@ -139,8 +158,9 @@ const registerLaunchTool = (
       let session: DebugWebSession | undefined;
       try {
         browser = await launchBrowser({
-          url: input.url ?? "about:blank",
+          url: input.url,
           ...(input.executable_path === undefined ? {} : { executablePath: input.executable_path }),
+          ...(input.user_data_dir === undefined ? {} : { userDataDir: input.user_data_dir }),
         });
         const endpoint = validateCdpEndpoint(browser.endpoint);
         const { target, pageUrl } = await findPageTarget(endpoint, input.url);
@@ -157,7 +177,10 @@ const registerLaunchTool = (
           origin: session.origin,
           allowed_origins: [...session.allowedOrigins].sort(),
           pid: browser.pid ?? null,
+          profile: browser.persistent ? "persistent" : "temporary",
+          profile_dir: browser.profileDir,
           status: "open",
+          capture_note: CAPTURE_NOTE,
         });
       } catch (cause) {
         if (session !== undefined) {
@@ -252,6 +275,7 @@ const registerOpenSessionTool = (server: McpServer, store: DebugWebSessionStore)
           origin: session.origin,
           allowed_origins: [...session.allowedOrigins].sort(),
           status: "open",
+          capture_note: CAPTURE_NOTE,
         });
       } catch (cause) {
         return failure(errorMessage(cause));
@@ -301,6 +325,8 @@ const registerQueryTools = (server: McpServer, store: DebugWebSessionStore): voi
       return result({
         total: requests.length,
         offset: input.offset,
+        closed: session.closed,
+        close_reason: session.closeReason,
         requests: requests.slice(input.offset, input.offset + input.limit).map(summaryOf),
       });
     },
@@ -342,6 +368,8 @@ const registerQueryTools = (server: McpServer, store: DebugWebSessionStore): voi
       return result({
         total: session.events.length,
         offset: input.offset,
+        closed: session.closed,
+        close_reason: session.closeReason,
         events: session.events.slice(input.offset, input.offset + input.limit),
       });
     },
@@ -358,8 +386,9 @@ const registerGetDomTool = (server: McpServer, store: DebugWebSessionStore): voi
     },
     async (raw) => {
       const input = debugWebGetDomInputSchema.parse(raw);
-      const session = liveSession(store, input.session_id);
-      if (session === undefined) return failure("Session is missing or its tab closed.");
+      const session = store.get(input.session_id);
+      if (session === undefined) return failure("Session not found.");
+      if (session.closed) return failure(closedMessage(session));
       try {
         const dom = await captureDomSnapshot(session.connection, {
           maxNodes: input.max_nodes,
@@ -375,6 +404,18 @@ const registerGetDomTool = (server: McpServer, store: DebugWebSessionStore): voi
   );
 };
 
+const requestBrowserClose = async (
+  session: DebugWebSession,
+  browser: LaunchedBrowser,
+): Promise<void> => {
+  try {
+    await Promise.race([session.connection.send("Browser.close"), delay(1_500)]);
+  } catch {
+    // Fall back to process termination.
+  }
+  await browser.close();
+};
+
 const registerCloseTool = (
   server: McpServer,
   store: DebugWebSessionStore,
@@ -384,7 +425,7 @@ const registerCloseTool = (
     "browser_close_session",
     {
       description:
-        "Detach, discard temporary data, and close only Debug Web's socket. If Debug Web launched the browser, that browser is stopped and its temporary profile deleted; a browser you started yourself is left running.",
+        "Detach, discard temporary data, and close only Debug Web's socket. If Debug Web launched the browser, that browser is closed gracefully; a temporary profile is deleted, while a persistent user_data_dir is kept. A browser you started yourself is left running.",
       inputSchema: sessionInput.shape,
     },
     async (raw) => {
@@ -392,12 +433,12 @@ const registerCloseTool = (
       const owned = browsers.get(input.session_id);
       const session = await store.close(input.session_id);
       if (session === undefined && owned === undefined) return failure("Session not found.");
+      if (owned !== undefined) browsers.delete(input.session_id);
       if (session !== undefined) {
+        if (owned !== undefined) await requestBrowserClose(session, owned);
         await disableDomains(session);
         await session.connection.close();
-      }
-      if (owned !== undefined) {
-        browsers.delete(input.session_id);
+      } else if (owned !== undefined) {
         await owned.close();
       }
       return result({
@@ -418,7 +459,7 @@ export const createDebugWebServer = (
     { name: "debug-web", version: "1.0.0" },
     {
       instructions:
-        "Debug Web launches a disposable Chrome (or attaches to one you started) and captures network, console, navigation, and WebSocket activity automatically. Call browser_launch, then browser_list_network_requests for a lean overview and browser_get_network_requests for full detail. Inspect only pages you are authorized to debug. Captures stay in process memory and are deleted on session/process closure; credentials are redacted. Screenshots are not provided.",
+        "Debug Web launches a disposable Chrome (or attaches to one you started) and captures network, console, navigation, and WebSocket activity automatically. Pass user_data_dir to reuse a persistent profile you sign into; it is kept when the session closes, while a default temporary profile is deleted. CDP does not replay history: requests made before the session opened are not captured, so reload the page after attaching to record its full load. Navigating outside the allowed origins closes the session. Call browser_launch, then browser_list_network_requests for a lean overview and browser_get_network_requests for full detail. Inspect only pages you are authorized to debug. Captures stay in process memory and are deleted on session/process closure; credentials are redacted. Screenshots are not provided.",
     },
   );
   registerLaunchTool(server, store, browsers);
@@ -437,6 +478,12 @@ export const runDebugWeb = async (): Promise<void> => {
   const close = (): void => {
     void (async () => {
       const sessions = await store.closeAll();
+      await Promise.all(
+        sessions.flatMap((session) => {
+          const owned = browsers.get(session.session_id);
+          return owned === undefined ? [] : [requestBrowserClose(session, owned)];
+        }),
+      );
       await Promise.all(
         sessions.map(async (session) => {
           await disableDomains(session);

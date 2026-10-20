@@ -105,6 +105,7 @@ export interface FakeCdp {
   readonly commands: string[];
   readonly socketCount: () => number;
   readonly waitForNoSockets: () => Promise<void>;
+  readonly navigateAway: (targetId: string, url: string) => void;
   readonly close: () => Promise<void>;
 }
 
@@ -151,6 +152,7 @@ export const startFakeCdp = async (): Promise<FakeCdp> => {
     throw new Error("Failed to bind fake CDP server.");
   port = address.port;
   const sockets = new Set<WebSocket>();
+  const socketByTarget = new Map<string, WebSocket>();
   let resolveNoSockets: (() => void) | undefined;
   const commands: string[] = [];
   const websocket = new WebSocketServer({ server: http });
@@ -161,8 +163,10 @@ export const startFakeCdp = async (): Promise<FakeCdp> => {
       return;
     }
     sockets.add(socket);
+    socketByTarget.set(target.id, socket);
     socket.on("close", () => {
       sockets.delete(socket);
+      socketByTarget.delete(target.id);
       if (sockets.size === 0) resolveNoSockets?.();
     });
     socket.on("message", (data) => {
@@ -237,6 +241,14 @@ export const startFakeCdp = async (): Promise<FakeCdp> => {
     endpoint: `http://127.0.0.1:${String(port)}`,
     commands,
     socketCount: () => sockets.size,
+    navigateAway: (targetId, url) => {
+      socketByTarget.get(targetId)?.send(
+        JSON.stringify({
+          method: "Page.frameNavigated",
+          params: { timestamp: 99, frame: { url } },
+        }),
+      );
+    },
     waitForNoSockets: async () => {
       if (sockets.size === 0) return;
       await new Promise<void>((resolve, reject) => {
